@@ -7,11 +7,12 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "index-docs": "node scripts/index-docs.mjs"
+    "index-docs": "python3 scripts/index-docs.py"
   },
   "dependencies": {
     "groq-sdk": "^1.1.2",
     "next": "^15.1.0",
+    "pdf-parse": "^2.4.5",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
