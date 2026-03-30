@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Dr PowerScale — PDF Indexing Script (PyMuPDF + MHTML)
+Dr PowerScale — PDF Indexer with Voyage AI + Supabase
 
-Converts PDFs and MHTML files in docs/raw-pdfs/ to searchable chunks.
+Extracts PDFs, generates real embeddings, stores in Supabase pgvector.
 
 Usage:
     python3 scripts/index-docs.py
 
-Output:
-    - docs/processed/*.md   (human-readable chunks)
-    - docs/embeddings.json   (machine-readable index for RAG)
+Requirements:
+    pip install --break-system-packages PyMuPDF supabase
 """
 
 import os
 import json
 import sys
-import math
+import time
 import re
 import email
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 from html.parser import HTMLParser
@@ -28,17 +28,35 @@ except ImportError:
     print("❌ PyMuPDF not installed. Run: pip install --break-system-packages PyMuPDF")
     sys.exit(1)
 
+try:
+    from supabase import create_client
+except ImportError:
+    print("❌ supabase not installed. Run: pip install --break-system-packages supabase")
+    sys.exit(1)
+
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_DIR = SCRIPT_DIR.parent
 PDF_DIR = PROJECT_DIR / "docs" / "raw-pdfs"
 PROCESSED_DIR = PROJECT_DIR / "docs" / "processed"
-EMBEDDINGS_FILE = PROJECT_DIR / "docs" / "embeddings.json"
+ENV_FILE = PROJECT_DIR / ".env.local"
 
 CHUNK_SIZE = 500       # Target tokens per chunk (~2000 chars)
 CHUNK_OVERLAP = 50     # Overlap tokens between chunks
-EMBEDDING_DIM = 384    # Embedding dimensions
+EMBED_BATCH_SIZE = 25  # Smaller batches to avoid rate limits
+VOYAGE_MODEL = "voyage-3"
+
+# ─── LOAD ENV ────────────────────────────────────────────────────────────────
+
+def load_env():
+    env = {}
+    if ENV_FILE.exists():
+        for line in ENV_FILE.read_text().splitlines():
+            if '=' in line and not line.strip().startswith('#'):
+                key, _, value = line.partition('=')
+                env[key.strip()] = value.strip()
+    return env
 
 # ─── HTML TEXT EXTRACTOR ─────────────────────────────────────────────────────
 
@@ -68,20 +86,17 @@ class HTMLTextExtractor(HTMLParser):
 
 
 def html_to_text(html_content):
-    """Extract readable text from HTML."""
     extractor = HTMLTextExtractor()
     extractor.feed(html_content)
     text = extractor.get_text()
-    # Clean up whitespace
     text = re.sub(r'\n\s*\n', '\n\n', text)
     text = re.sub(r' +', ' ', text)
     return text.strip()
 
 
-# ─── EXTRACTION FUNCTIONS ────────────────────────────────────────────────────
+# ─── EXTRACTION ──────────────────────────────────────────────────────────────
 
 def is_mhtml(filepath):
-    """Check if file is MHTML (web page snapshot) not a real PDF."""
     try:
         with open(filepath, 'rb') as f:
             header = f.read(100)
@@ -91,24 +106,18 @@ def is_mhtml(filepath):
 
 
 def extract_mhtml_text(filepath):
-    """Extract text from MHTML web page snapshot."""
     try:
         with open(filepath, 'r', errors='ignore') as f:
             msg = email.message_from_string(f.read())
-        
         for part in msg.walk():
-            content_type = part.get_content_type()
-            if content_type == 'text/html':
+            if part.get_content_type() == 'text/html':
                 payload = part.get_payload(decode=True)
                 if payload:
                     charset = part.get_content_charset() or 'utf-8'
                     html = payload.decode(charset, errors='ignore')
                     return html_to_text(html)
-        
-        # Fallback: try as raw HTML
         with open(filepath, 'r', errors='ignore') as f:
             content = f.read()
-        # Find HTML content after headers
         html_start = content.find('<!DOCTYPE')
         if html_start == -1:
             html_start = content.find('<html')
@@ -116,14 +125,12 @@ def extract_mhtml_text(filepath):
             html_start = content.find('<HTML')
         if html_start != -1:
             return html_to_text(content[html_start:])
-        
         return html_to_text(content)
-    except Exception as e:
+    except:
         return None
 
 
 def extract_pdf_text(filepath):
-    """Extract text from PDF using PyMuPDF."""
     try:
         doc = fitz.open(str(filepath))
         text_parts = []
@@ -133,12 +140,11 @@ def extract_pdf_text(filepath):
                 text_parts.append(page_text)
         doc.close()
         return "\n\n".join(text_parts) if text_parts else None
-    except Exception as e:
+    except:
         return None
 
 
 def extract_text(filepath):
-    """Auto-detect format and extract text."""
     if is_mhtml(filepath):
         return extract_mhtml_text(filepath), "mhtml"
     else:
@@ -148,7 +154,6 @@ def extract_text(filepath):
 # ─── CHUNKING ────────────────────────────────────────────────────────────────
 
 def chunk_text(text, source_name, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Split text into overlapping chunks."""
     char_size = chunk_size * 4
     char_overlap = overlap * 4
     chunks = []
@@ -169,7 +174,6 @@ def chunk_text(text, source_name, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
                 "index": chunk_index,
                 "text": current_chunk.strip(),
             })
-
             words = current_chunk.split()
             overlap_words = words[-max(1, char_overlap // 5):]
             current_chunk = " ".join(overlap_words) + "\n\n" + para
@@ -188,16 +192,121 @@ def chunk_text(text, source_name, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 
-def seeded_random(seed):
-    """Deterministic pseudo-random for placeholder embeddings."""
-    x = math.sin(seed) * 10000
-    return x - math.floor(x)
+# ─── VOYAGE EMBEDDINGS ───────────────────────────────────────────────────────
+
+def embed_batch(texts, api_key, max_retries=5):
+    """Embed a batch of texts using Voyage AI API with retry logic."""
+    url = "https://api.voyageai.com/v1/embeddings"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = json.dumps({
+        "model": VOYAGE_MODEL,
+        "input": texts,
+    }).encode("utf-8")
+
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = json.loads(resp.read().decode("utf-8"))
+            return [item["embedding"] for item in result["data"]]
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                wait = min(2 ** (attempt + 1), 30)  # Exponential backoff, max 30s
+                print(f" ⏳ rate limited, waiting {wait}s...")
+                time.sleep(wait)
+            else:
+                raise
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            else:
+                raise
+
+    return [[0.0] * 1024] * len(texts)
+
+
+def embed_all_chunks(chunks, api_key):
+    """Embed all chunks in batches."""
+    all_embeddings = []
+    total_batches = (len(chunks) + EMBED_BATCH_SIZE - 1) // EMBED_BATCH_SIZE
+
+    for i in range(0, len(chunks), EMBED_BATCH_SIZE):
+        batch = chunks[i:i + EMBED_BATCH_SIZE]
+        texts = [c["text"] for c in batch]
+        batch_num = i // EMBED_BATCH_SIZE + 1
+
+        sys.stdout.write(f"  Embedding batch {batch_num}/{total_batches} ({len(batch)} chunks)...")
+
+        try:
+            embeddings = embed_batch(texts, api_key)
+            all_embeddings.extend(embeddings)
+            print(f" ✅")
+        except Exception as e:
+            print(f" ❌ {str(e)[:60]}")
+            # Add empty embeddings as fallback
+            all_embeddings.extend([[0.0] * 1024] * len(batch))
+
+        # Rate limit: delay between batches
+        if i + EMBED_BATCH_SIZE < len(chunks):
+            time.sleep(2)
+
+    return all_embeddings
+
+
+# ─── SUPABASE ────────────────────────────────────────────────────────────────
+
+def upsert_chunks(chunks, embeddings, supabase_url, supabase_key):
+    """Upsert chunks into Supabase in batches."""
+    client = create_client(supabase_url, supabase_key)
+
+    batch_size = 100  # Supabase upsert limit
+    total_batches = (len(chunks) + batch_size - 1) // batch_size
+
+    for i in range(0, len(chunks), batch_size):
+        batch_chunks = chunks[i:i + batch_size]
+        batch_embeddings = embeddings[i:i + batch_size]
+        batch_num = i // batch_size + 1
+
+        rows = []
+        for chunk, embedding in zip(batch_chunks, batch_embeddings):
+            rows.append({
+                "id": chunk["id"],
+                "source": chunk["source"],
+                "chunk_index": chunk["index"],
+                "text": chunk["text"],
+                "embedding": embedding,
+            })
+
+        sys.stdout.write(f"  Upserting batch {batch_num}/{total_batches} ({len(rows)} rows)...")
+
+        try:
+            client.table("chunks").upsert(rows).execute()
+            print(f" ✅")
+        except Exception as e:
+            print(f" ❌ {str(e)[:80]}")
+
+        time.sleep(0.2)
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
-    print("📚 Dr PowerScale — PDF/MHTML Indexer\n")
+    print("📚 Dr PowerScale — PDF Indexer (Voyage AI + Supabase)\n")
+
+    env = load_env()
+    voyage_key = env.get("VOYAGE_API_KEY")
+    supabase_url = env.get("SUPABASE_URL")
+    supabase_key = env.get("SUPABASE_ANON_KEY")
+
+    if not all([voyage_key, supabase_url, supabase_key]):
+        print("❌ Missing env vars in .env.local:")
+        print(f"   VOYAGE_API_KEY: {'✅' if voyage_key else '❌'}")
+        print(f"   SUPABASE_URL: {'✅' if supabase_url else '❌'}")
+        print(f"   SUPABASE_ANON_KEY: {'✅' if supabase_key else '❌'}")
+        sys.exit(1)
 
     if not PDF_DIR.exists():
         print(f"❌ PDF directory not found: {PDF_DIR}")
@@ -211,28 +320,24 @@ def main():
 
     pdf_count = sum(1 for f in files if not is_mhtml(f))
     mhtml_count = sum(1 for f in files if is_mhtml(f))
-
     print(f"Found {len(files)} file(s): {pdf_count} real PDFs, {mhtml_count} MHTML snapshots\n")
-    for f in files:
-        size_kb = f.stat().st_size / 1024
-        fmt = "MHTML" if is_mhtml(f) else "PDF"
-        print(f"   📄 {f.name} ({size_kb:.0f} KB, {fmt})")
-    print()
 
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Step 1: Extract and chunk
+    print("⏳ Step 1: Extracting text and chunking...\n")
     all_chunks = []
     success_count = 0
     fail_count = 0
 
     for filepath in files:
         source_name = filepath.stem
-        sys.stdout.write(f"⏳ {filepath.name}...")
+        sys.stdout.write(f"  {filepath.name}...")
 
         text, fmt = extract_text(filepath)
 
         if not text or len(text.strip()) < 50:
-            print(" ⚠️  No text extracted")
+            print(" ⚠️  No text")
             fail_count += 1
             continue
 
@@ -247,44 +352,30 @@ def main():
         print(f" ✅ {len(chunks)} chunks ({fmt})")
         success_count += 1
 
-    print(f"\n📊 Results: {success_count} OK, {fail_count} failed")
-    print(f"   {len(all_chunks)} total chunks")
+    print(f"\n📊 Extracted: {success_count} OK, {fail_count} failed, {len(all_chunks)} total chunks\n")
 
-    # Generate placeholder embeddings
-    print("⏳ Generating placeholder embeddings...")
+    # Step 2: Clear existing data and generate embeddings
+    print("⏳ Step 2: Clearing old data from Supabase...\n")
+    try:
+        client = create_client(supabase_url, supabase_key)
+        # Delete all existing chunks
+        client.table("chunks").delete().neq("id", "").execute()
+        print("  ✅ Cleared\n")
+    except Exception as e:
+        print(f"  ⚠️  {str(e)[:60]} (continuing anyway)\n")
 
-    for chunk in all_chunks:
-        text_hash = sum(ord(c) for c in chunk["text"])
-        chunk["embedding"] = [
-            seeded_random(text_hash + i) * 2 - 1
-            for i in range(EMBEDDING_DIM)
-        ]
+    print("⏳ Step 3: Generating Voyage embeddings...\n")
+    embeddings = embed_all_chunks(all_chunks, voyage_key)
+    print(f"\n📊 Embedded: {len(embeddings)} vectors\n")
 
-    index = {
-        "version": 1,
-        "chunkSize": CHUNK_SIZE,
-        "chunkOverlap": CHUNK_OVERLAP,
-        "embeddingDim": EMBEDDING_DIM,
-        "generatedAt": datetime.now().isoformat(),
-        "totalChunks": len(all_chunks),
-        "chunks": [
-            {
-                "id": c["id"],
-                "source": c["source"],
-                "index": c["index"],
-                "text": c["text"],
-                "embedding": c["embedding"],
-            }
-            for c in all_chunks
-        ],
-    }
+    # Step 4: Upsert to Supabase
+    print("⏳ Step 4: Upserting to Supabase...\n")
+    upsert_chunks(all_chunks, embeddings, supabase_url, supabase_key)
 
-    EMBEDDINGS_FILE.write_text(json.dumps(index), encoding="utf-8")
-
-    file_size_mb = EMBEDDINGS_FILE.stat().st_size / 1024 / 1024
-    print(f"\n✅ Index saved: {file_size_mb:.2f} MB")
-    print(f"   {len(all_chunks)} chunks from {success_count}/{len(files)} files")
-    print("\n📌 Next: git add -A && git commit && git push")
+    print(f"\n✅ Done!")
+    print(f"   {len(all_chunks)} chunks embedded and stored in Supabase")
+    print(f"   Model: {VOYAGE_MODEL} (1024 dimensions)")
+    print(f"\n📌 Next: Update Vercel API route + deploy")
 
 
 if __name__ == "__main__":
