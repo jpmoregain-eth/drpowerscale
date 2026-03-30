@@ -84,7 +84,7 @@ Current flow:
 ## What's Needed to Resume
 
 ### Accounts Ready ✅
-1. **Supabase** — ❌ NOT YET (create at supabase.com)
+1. **Supabase** — ✅ Project: `otyuvcuniwdvtcznxeai` (pgvector enabled)
 2. **Voyage AI** — ✅ Key saved in `.env.local`
 
 ---
