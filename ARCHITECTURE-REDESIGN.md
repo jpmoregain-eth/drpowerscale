@@ -39,7 +39,7 @@ Current flow:
 ┌─────────────────────────────────────────────────────┐
 │                   LOCAL (Legion 5)                    │
 │                                                       │
-│  PDFs → PyMuPDF → chunks → OpenAI embed → INSERT     │
+│  PDFs → PyMuPDF → chunks → Voyage embed → INSERT      │
 │  Run once, or when adding new docs                    │
 │                                                       │
 │  Script: scripts/index-docs.py (upgrade to embed)     │
@@ -53,14 +53,14 @@ Current flow:
               │  - id           │
               │  - source       │
               │  - text         │
-              │  - embedding    │ ← 1536-dim vector (OpenAI)
+              │  - embedding    │ ← 1024-dim vector (Voyage)
               └────────┬────────┘
                        │
               ┌────────▼────────┐
               │  Vercel (API)   │
               │                 │
               │ 1. User asks Q  │
-              │ 2. OpenAI embed │ ← embed the query
+              │ 2. Voyage embed │ ← embed the query
               │    the query    │
               │ 3. Supabase     │ ← vector similarity search
               │    vector search│
@@ -83,21 +83,9 @@ Current flow:
 
 ## What's Needed to Resume
 
-### Accounts to Create
-1. **Supabase** — https://supabase.com (free tier)
-   - Create project
-   - Get: Project URL + anon key
-   - Enable pgvector extension
-
-2. **OpenAI** — https://platform.openai.com
-   - Create API key
-   - For: Query embeddings (text-embedding-3-small, 1536 dims)
-   - Cost: ~$0.01/month for chatbot volume
-
-### Share with GoldmanSax
-- Supabase URL + anon key
-- OpenAI API key
-- (Will add to Vercel environment variables)
+### Accounts Ready ✅
+1. **Supabase** — ❌ NOT YET (create at supabase.com)
+2. **Voyage AI** — ✅ Key saved in `.env.local`
 
 ---
 
@@ -114,7 +102,7 @@ CREATE TABLE chunks (
   source TEXT NOT NULL,
   chunk_index INT NOT NULL,
   text TEXT NOT NULL,
-  embedding vector(1536)
+  embedding vector(1024)
 );
 
 -- Create index for fast similarity search
@@ -123,19 +111,19 @@ CREATE INDEX ON chunks USING ivfflat (embedding vector_cosine_ops);
 
 ### Step 2: Update Local Indexer
 - Upgrade `scripts/index-docs.py`
-- Add OpenAI embedding generation (text-embedding-3-small)
+- Add Voyage embedding generation (voyage-3)
 - Add Supabase INSERT logic
 - Run once to populate DB
 
 ### Step 3: Update Vercel API Route
 - Add `@supabase/supabase-js` dependency
-- Add OpenAI dependency (for query embedding)
+- Add Voyage AI dependency (for query embedding)
 - Implement `retrieveContext()` function:
-  1. Embed user's question via OpenAI
+  1. Embed user's question via Voyage
   2. Query Supabase for top 5 similar chunks
   3. Return formatted context
 - Inject context into system prompt as `[CONTEXT]`
-- Add env vars: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `OPENAI_API_KEY`
+- Add env vars: `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `VOYAGE_API_KEY`
 
 ### Step 4: Remove Old Embeddings
 - Delete `docs/embeddings.json` (35MB placeholder file)
@@ -157,7 +145,7 @@ drpowerscale/
 │   ├── raw-pdfs/              ← 62 PDFs (keep for reference)
 │   └── processed/             ← Human-readable markdown chunks
 ├── scripts/
-│   └── index-docs.py          ← PDF → chunks → OpenAI embed → Supabase
+│   └── index-docs.py          ← PDF → chunks → Voyage embed → Supabase
 ├── src/
 │   └── app/
 │       └── api/
