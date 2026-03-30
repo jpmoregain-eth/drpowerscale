@@ -1,0 +1,13 @@
+@import "tailwindcss";
+
+:root {
+  --dell-blue: #0076CE;
+  --dell-dark: #001E2B;
+  --dell-light: #E8F4FD;
+  --dell-accent: #00A4EF;
+}
+
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  color: var(--dell-dark);
+}
