@@ -16,35 +16,70 @@ function getSupabase() {
 
 // ─── RAG KEYWORD SEARCH ─────────────────────────────────────────────────────
 
+// PowerScale-specific technical terms to keep intact
+const TECHNICAL_TERMS = [
+  "smartconnect", "synciq", "snapshot", "snapshotiq", "smartlock", "worm",
+  "smartpools", "smartdedupe", "isi", "onefs", "isilon", "powerscale",
+  "nfs", "smb", "cifs", "hdfs", "s3", "ndmp", "rbac", "ad", "ldap", "nis",
+  "groupnet", "subnet", "pool", "node", "cluster", "failover", "replication",
+  "snapshot", "quota", "dedupe", "compression", "tiering", "archiving"
+];
+
 async function retrieveContext(query: string): Promise<string> {
   try {
     const supabase = getSupabase();
+    const lowerQuery = query.toLowerCase();
 
-    // Extract keywords (3+ chars, deduplicated)
-    const words = [...new Set(
-      query.toLowerCase()
+    // Step 1: Extract multi-word technical terms first (highest priority)
+    const technicalMatches: string[] = [];
+    for (const term of TECHNICAL_TERMS) {
+      if (lowerQuery.includes(term)) {
+        technicalMatches.push(term);
+      }
+    }
+
+    // Step 2: Extract individual keywords (3+ chars, excluding parts of technical terms)
+    const individualWords = [...new Set(
+      lowerQuery
         .split(/\W+/)
-        .filter(w => w.length >= 3)
+        .filter(w => w.length >= 3 && !TECHNICAL_TERMS.some(t => t.includes(w) && t !== w))
     )];
 
-    if (words.length === 0) return "";
+    // Combine: technical terms first (higher priority), then individual words
+    const searchTerms = [...new Set([...technicalMatches, ...individualWords])].slice(0, 8);
 
-    // Search each keyword, merge + score results
+    if (searchTerms.length === 0) return "";
+
+    console.log("RAG search terms:", searchTerms);
+
+    // Search each term, merge + score results
     const scored: Map<string, { source: string; text: string; score: number }> = new Map();
 
-    for (const word of words.slice(0, 5)) {
+    for (const term of searchTerms) {
       const { data } = await supabase
         .from("chunks")
         .select("id, source, text")
-        .ilike("text", `%${word}%`)
+        .ilike("text", `%${term}%`)
         .limit(20);
 
       if (data) {
         for (const row of data) {
           const existing = scored.get(row.id);
-          const wordCount = (row.text.toLowerCase().match(new RegExp(word.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), "g")) || []).length;
-          const sourceBonus = row.source.toLowerCase().includes(word) ? 5 : 0;
-          const score = wordCount * 2 + sourceBonus;
+          const rowText = row.text.toLowerCase();
+          
+          // Count term occurrences
+          const termRegex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), "g");
+          const termCount = (rowText.match(termRegex) || []).length;
+          
+          // Bonus for technical terms (higher weight)
+          const isTechnicalTerm = TECHNICAL_TERMS.includes(term);
+          const technicalBonus = isTechnicalTerm ? 10 : 0;
+          
+          // Bonus if term appears in source filename
+          const sourceBonus = row.source.toLowerCase().includes(term) ? 5 : 0;
+          
+          // Calculate score: term matches * weight + bonuses
+          const score = termCount * (isTechnicalTerm ? 3 : 2) + technicalBonus + sourceBonus;
 
           if (existing) {
             existing.score += score;
@@ -61,6 +96,8 @@ async function retrieveContext(query: string): Promise<string> {
       .slice(0, 5);
 
     if (top5.length === 0) return "";
+
+    console.log(`RAG found ${top5.length} relevant chunks`);
 
     return top5
       .map(r => `[Source: ${r.source}]\n${r.text.slice(0, 1500)}`)
