@@ -22,7 +22,8 @@ const TECHNICAL_TERMS = [
   "smartpools", "smartdedupe", "isi", "onefs", "isilon", "powerscale",
   "nfs", "smb", "cifs", "hdfs", "s3", "ndmp", "rbac", "ad", "ldap", "nis",
   "groupnet", "subnet", "pool", "node", "cluster", "failover", "replication",
-  "snapshot", "quota", "dedupe", "compression", "tiering", "archiving"
+  "snapshot", "quota", "dedupe", "compression", "tiering", "archiving",
+  "ethernet", "switch", "arista", "backend", "frontend", "network"
 ];
 
 async function retrieveContext(query: string): Promise<string> {
@@ -119,7 +120,7 @@ You ONLY answer questions about:
 - Dell Isilon (legacy name for PowerScale, including all OneFS versions)
 - OneFS operating system (the OS that runs on PowerScale/Isilon clusters)
 - NAS protocols: NFS, SMB/CIFS, HDFS, S3 (on PowerScale)
-- NAS-specific networking: SmartConnect, GroupNet, subnet, pool, static routes
+- NAS-specific networking: SmartConnect, GroupNet, subnet, pool, static routes, backend Ethernet switches, frontend Ethernet switches, Arista switches (when used with PowerScale)
 - Data protection & replication: SyncIQ, snapshots, NDMP, SmartLock (WORM)
 - Storage efficiency: SmartPools, SmartDedupe, SmartConnect, isi_classify
 - Security & compliance: RBAC, audit, access zones, authentication providers (AD, LDAP, NIS, local)
