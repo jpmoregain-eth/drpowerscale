@@ -1,5 +1,6 @@
 import Groq from "groq-sdk";
 import { createClient } from "@supabase/supabase-js";
+import VoyageAI from "voyageai";
 
 // ─── CLIENTS (created per-request to avoid build-time env errors) ───────────
 
@@ -14,94 +15,49 @@ function getSupabase() {
   );
 }
 
-// ─── RAG KEYWORD SEARCH ─────────────────────────────────────────────────────
+function getVoyage() {
+  return new VoyageAI({ apiKey: process.env.VOYAGE_API_KEY! });
+}
 
-// PowerScale-specific technical terms to keep intact
-const TECHNICAL_TERMS = [
-  "smartconnect", "synciq", "snapshot", "snapshotiq", "smartlock", "worm",
-  "smartpools", "smartdedupe", "isi", "onefs", "isilon", "powerscale",
-  "nfs", "smb", "cifs", "hdfs", "s3", "ndmp", "rbac", "ad", "ldap", "nis",
-  "groupnet", "subnet", "pool", "node", "cluster", "failover", "replication",
-  "snapshot", "quota", "dedupe", "compression", "tiering", "archiving",
-  "ethernet", "switch", "arista", "backend", "frontend", "network"
-];
+// ─── RAG VECTOR SEARCH ──────────────────────────────────────────────────────
 
 async function retrieveContext(query: string): Promise<string> {
   try {
+    const voyage = getVoyage();
     const supabase = getSupabase();
-    const lowerQuery = query.toLowerCase();
 
-    // Step 1: Extract multi-word technical terms first (highest priority)
-    const technicalMatches: string[] = [];
-    for (const term of TECHNICAL_TERMS) {
-      if (lowerQuery.includes(term)) {
-        technicalMatches.push(term);
-      }
+    // Step 1: Embed the query using Voyage AI
+    console.log("RAG: Embedding query...");
+    const embedResult = await voyage.embed({
+      input: query,
+      model: "voyage-3",
+    });
+
+    const queryEmbedding = embedResult.data[0].embedding;
+    console.log("RAG: Query embedded, searching Supabase...");
+
+    // Step 2: Call Supabase RPC for vector similarity search
+    const { data, error } = await supabase.rpc("match_chunks", {
+      query_embedding: queryEmbedding,
+      match_threshold: 0.5,  // Cosine similarity threshold
+      match_count: 5,        // Top 5 chunks
+    });
+
+    if (error) {
+      console.error("RAG: Supabase RPC error:", error);
+      return "";
     }
 
-    // Step 2: Extract individual keywords (3+ chars, excluding parts of technical terms)
-    const individualWords = [...new Set(
-      lowerQuery
-        .split(/\W+/)
-        .filter(w => w.length >= 3 && !TECHNICAL_TERMS.some(t => t.includes(w) && t !== w))
-    )];
-
-    // Combine: technical terms first (higher priority), then individual words
-    const searchTerms = [...new Set([...technicalMatches, ...individualWords])].slice(0, 8);
-
-    if (searchTerms.length === 0) return "";
-
-    console.log("RAG search terms:", searchTerms);
-
-    // Search each term, merge + score results
-    const scored: Map<string, { source: string; text: string; score: number }> = new Map();
-
-    for (const term of searchTerms) {
-      const { data } = await supabase
-        .from("chunks")
-        .select("id, source, text")
-        .ilike("text", `%${term}%`)
-        .limit(20);
-
-      if (data) {
-        for (const row of data) {
-          const existing = scored.get(row.id);
-          const rowText = row.text.toLowerCase();
-          
-          // Count term occurrences
-          const termRegex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), "g");
-          const termCount = (rowText.match(termRegex) || []).length;
-          
-          // Bonus for technical terms (higher weight)
-          const isTechnicalTerm = TECHNICAL_TERMS.includes(term);
-          const technicalBonus = isTechnicalTerm ? 10 : 0;
-          
-          // Bonus if term appears in source filename
-          const sourceBonus = row.source.toLowerCase().includes(term) ? 5 : 0;
-          
-          // Calculate score: term matches * weight + bonuses
-          const score = termCount * (isTechnicalTerm ? 3 : 2) + technicalBonus + sourceBonus;
-
-          if (existing) {
-            existing.score += score;
-          } else {
-            scored.set(row.id, { source: row.source, text: row.text, score });
-          }
-        }
-      }
+    if (!data || data.length === 0) {
+      console.log("RAG: No relevant chunks found");
+      return "";
     }
 
-    // Sort by score, take top 5
-    const top5 = [...scored.values()]
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
+    console.log(`RAG: Found ${data.length} relevant chunks`);
 
-    if (top5.length === 0) return "";
-
-    console.log(`RAG found ${top5.length} relevant chunks`);
-
-    return top5
-      .map(r => `[Source: ${r.source}]\n${r.text.slice(0, 1500)}`)
+    // Step 3: Format context for LLM
+    return data
+      .map((row: any) => `[Source: ${row.source} (similarity: ${(row.similarity * 100).toFixed(1)}%)]\n${row.text.slice(0, 1500)}`)
       .join("\n\n---\n\n");
   } catch (err) {
     console.error("RAG search error:", err);
@@ -209,7 +165,7 @@ export async function POST(request: Request) {
   try {
     const { messages } = await request.json();
 
-    // RAG: retrieve relevant context from Supabase
+    // RAG: retrieve relevant context from Supabase using vector search
     const lastUserMessage = messages.filter((m: any) => m.role === "user").pop()?.content || "";
     const ragContext = await retrieveContext(lastUserMessage);
 
